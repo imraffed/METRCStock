@@ -23,6 +23,16 @@
     th { background: #f9fafb; }
     .footer { margin-top: 16px; font-size: 12px; color: #6b7280; }
     .hidden { display: none; }
+
+    /* Highlight styles to distinguish current floor ID/qty vs restock ID/qty */
+    .highlight-green {
+      background: #d1fae5; /* light green */
+      color: #065f46;     /* dark green */
+    }
+    .highlight-red {
+      background: #fee2e2; /* light red */
+      color: #991b1b;     /* dark red */
+    }
   </style>
 </head>
 <body>
@@ -93,7 +103,8 @@
           <th>Day Vault Available</th>
           <th>Vault Available</th>
           <th>Batch</th>
-          <th>External ID</th>
+          <th>External ID (Restock)</th>
+          <th>Current Floor ID</th>
         </tr>
       </thead>
       <tbody id="lowListBody"></tbody>
@@ -291,6 +302,19 @@ getEl('analyzeBtn').addEventListener('click', function() {
         }
       }
     }
+    // Determine which external ID is currently on the sales floor for each product.
+    // We choose the external ID with the highest sales floor quantity.
+    var floorIdByProduct = {};
+    Object.keys(byGroup).forEach(function(keyG) {
+      var rec = byGroup[keyG];
+      if (rec.floor > 0) {
+        var prod = rec.product;
+        var current = floorIdByProduct[prod];
+        if (!current || rec.floor > (byGroup[prod + '||' + current] ? byGroup[prod + '||' + current].floor : 0)) {
+          floorIdByProduct[prod] = rec.external;
+        }
+      }
+    });
     // Build list of groups meeting low stock criteria
     var list = [];
     var groupKeys = Object.keys(byGroup);
@@ -376,6 +400,8 @@ getEl('analyzeBtn').addEventListener('click', function() {
         chosen = chooseFrom[0];
       }
       if (chosen) {
+        // attach the floor external ID for display
+        chosen.floorExternal = floorIdByProduct[prod] || '';
         filtered.push(chosen);
       }
     });
@@ -395,10 +421,10 @@ getEl('downloadBtn').addEventListener('click', function() {
   var list = window.__displayRows || window.__lowRows || [];
   if (!list.length) return;
   var rows = [];
-  rows.push(['Product','Sales Floor Available','Day Vault Available','Vault Available','Batch','External ID']);
+  rows.push(['Product','Sales Floor Available','Day Vault Available','Vault Available','Batch','External ID (Restock)','Current Floor ID']);
   for (var i = 0; i < list.length; i++) {
     var it = list[i];
-    rows.push([it.product, it.floor, it.dayVault, it.vault, it.batch, it.external]);
+    rows.push([it.product, it.floor, it.dayVault, it.vault, it.batch, it.external, it.floorExternal || '']);
   }
   var csv = toCSV(rows);
   var blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
@@ -480,17 +506,24 @@ function refreshDisplay() {
   } else {
     getEl('lowListEmpty').classList.add('hidden');
     getEl('lowListTable').classList.remove('hidden');
-    for (var k = 0; k < rows.length; k++) {
-      var it2 = rows[k];
-      var tr = document.createElement('tr');
-      tr.innerHTML = '<td>'+escapeHtml(it2.product)+'</td>'+
-                     '<td>'+it2.floor+'</td>'+
-                     '<td>'+it2.dayVault+'</td>'+
-                     '<td>'+it2.vault+'</td>'+
-                     '<td>'+escapeHtml(it2.batch)+'</td>'+
-                     '<td>'+escapeHtml(it2.external)+'</td>';
-      tbody.appendChild(tr);
-    }
+      for (var k = 0; k < rows.length; k++) {
+        var it2 = rows[k];
+        var diff = it2.floorExternal && it2.external && it2.floorExternal !== it2.external;
+        var floorClass = diff ? 'highlight-green' : '';
+        var floorExtClass = diff ? 'highlight-green' : '';
+        var extClass = diff ? 'highlight-red' : '';
+        var dayClass = (diff && it2.dayVault > 0) ? 'highlight-red' : '';
+        var vaultClass = (diff && it2.vault > 0) ? 'highlight-red' : '';
+        var tr = document.createElement('tr');
+        tr.innerHTML = '<td>'+escapeHtml(it2.product)+'</td>'+
+                       '<td class="'+floorClass+'">'+it2.floor+'</td>'+
+                       '<td class="'+dayClass+'">'+it2.dayVault+'</td>'+
+                       '<td class="'+vaultClass+'">'+it2.vault+'</td>'+
+                       '<td>'+escapeHtml(it2.batch)+'</td>'+
+                       '<td class="'+extClass+'">'+escapeHtml(it2.external)+'</td>'+
+                       '<td class="'+floorExtClass+'">'+escapeHtml(it2.floorExternal || '')+'</td>';
+        tbody.appendChild(tr);
+      }
   }
   // Update summary text using analysis info
   var info = window.__analysisInfo || { total: 0, threshold: 0 };
