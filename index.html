@@ -23,6 +23,16 @@
     th { background: #f9fafb; }
     .footer { margin-top: 16px; font-size: 12px; color: #6b7280; }
     .hidden { display: none; }
+
+    /* Highlight styles to distinguish current floor ID/qty vs restock ID/qty */
+    .highlight-green {
+      background: #d1fae5; /* light green */
+      color: #065f46;     /* dark green */
+    }
+    .highlight-red {
+      background: #fee2e2; /* light red */
+      color: #991b1b;     /* dark red */
+    }
   </style>
 </head>
 <body>
@@ -51,10 +61,37 @@
     <div class="actions" style="justify-content: space-between;">
       <div>
         <span class="pill">Sales Floor ≤ threshold</span>
-        <span class="pill">Day Vault = 0</span>
-        <span class="pill">Vault &gt; 0</span>
+        <span class="pill">Additional stock (Day Vault or Vault)</span>
+        <span class="pill">FIFO: current External → Day Vault → Vault</span>
       </div>
-      <div class="muted">Columns used: Product, Available, Room, Batch, External ID</div>
+      <div class="muted">
+        Columns used: Product, Available, Room, Batch, External ID, Inventory date/Expiration date.<br>
+        Restock order: For each product, the External ID currently on the Sales Floor is used until its extra stock (Day Vault or Vault) is exhausted. Then the next oldest External ID is selected based on Inventory date (or Expiration date if Inventory date is missing), preferring Day Vault stock over Vault stock. The “Restock Room” column shows which sub‑room (Day Vault or Vault) the tool recommends pulling from.
+      </div>
+      <!-- Sorting and filtering controls -->
+      <div id="controls" class="actions" style="flex-wrap:wrap; margin-top:12px; gap:12px;">
+        <label style="font-size:13px;">
+          Sort by:
+          <select id="sortField" style="margin-left:4px; padding:4px 6px; border:1px solid #d1d5db; border-radius:6px; font-size:13px;">
+            <option value="product">Product A→Z</option>
+            <option value="product-desc">Product Z→A</option>
+            <option value="floor">Sales Floor ↑</option>
+            <option value="floor-desc">Sales Floor ↓</option>
+            <option value="dayVault">Day Vault ↑</option>
+            <option value="dayVault-desc">Day Vault ↓</option>
+            <option value="vault">Vault ↑</option>
+            <option value="vault-desc">Vault ↓</option>
+          </select>
+        </label>
+        <label style="font-size:13px;">
+          Filter:
+          <select id="filterStock" style="margin-left:4px; padding:4px 6px; border:1px solid #d1d5db; border-radius:6px; font-size:13px;">
+            <option value="all">All restocks</option>
+            <option value="day">Day Vault only</option>
+            <option value="vault">Vault only</option>
+          </select>
+        </label>
+      </div>
     </div>
     <h2 style="margin:14px 0 6px; font-size:16px;">Low stock list</h2>
     <div id="lowListEmpty" class="muted">No items yet.</div>
@@ -66,12 +103,15 @@
           <th>Day Vault Available</th>
           <th>Vault Available</th>
           <th>Batch</th>
-          <th>External ID</th>
+          <th>External ID (Restock)</th>
+          <th>Current Floor ID</th>
+          <th>Restock Room</th>
+          <th>Subroom</th>
         </tr>
       </thead>
       <tbody id="lowListBody"></tbody>
     </table>
-    <div class="footer">Tip: The tool groups by Product and sums “Available” per Room. Make sure your CSV headers match “Product”, “Room”, “Available”, “Batch”, and your external ID column (e.g. “External package ID”).</div>
+    <div class="footer">Tip: The tool groups by Product and sums “Available” per Room. Make sure your CSV headers match “Product”, “Room”, “Available”, “Batch”, your external ID column (e.g. “External package ID”), and (optionally) “Inventory date” or “Expiration date” for FIFO ordering. The “Restock Room” column indicates whether the suggested restock comes from Day Vault or Vault.</div>
   </div>
 
 <script>
@@ -155,6 +195,10 @@ function updateStatus() {
 getEl('csvFile').addEventListener('change', updateStatus);
 getEl('threshold').addEventListener('input', updateStatus);
 
+// When sort/filter controls change, refresh the display
+getEl('sortField').addEventListener('change', function(){ refreshDisplay(); });
+getEl('filterStock').addEventListener('change', function(){ refreshDisplay(); });
+
 getEl('analyzeBtn').addEventListener('click', function() {
   var fileInput = getEl('csvFile');
   if (!(fileInput.files && fileInput.files.length > 0)) {
@@ -178,6 +222,11 @@ getEl('analyzeBtn').addEventListener('click', function() {
     var idxRoom = header.findIndex(function(h){ return h.toLowerCase() === 'room'; });
     var idxBatch = header.findIndex(function(h){ return h.toLowerCase() === 'batch'; });
     var idxExternal = header.findIndex(function(h){ return h.toLowerCase().indexOf('external') !== -1; });
+    var idxExp = header.findIndex(function(h){ return h.toLowerCase().indexOf('expiration') !== -1; });
+    // Inventory date column (FIFO). Optional; use if available.
+    var idxInv = header.findIndex(function(h){ return h.toLowerCase().indexOf('inventory date') !== -1; });
+    // Subroom column (for displaying the subroom where the stock resides). Optional.
+    var idxSubRoom = header.findIndex(function(h){ return h.toLowerCase().indexOf('subroom') !== -1; });
     if (idxProduct === -1 || idxAvailable === -1 || idxRoom === -1) {
       getEl('status').textContent = 'Missing required headers. Need Product, Available, and Room.';
       return;
@@ -186,88 +235,237 @@ getEl('analyzeBtn').addEventListener('click', function() {
     var threshRaw = getEl('threshold').value.trim();
     var threshold = parseInt(threshRaw, 10);
     if (isNaN(threshold) || threshold < 0) threshold = 0;
-    // Group by product
-    var byProduct = {};
+    /*
+     * Group inventory by product and external ID. The tool historically
+     * aggregated all external IDs for a given product together, but the
+     * business requirement is to treat each external package ID as its own
+     * line item. If a product has multiple external IDs (e.g. different
+     * packages or batches), each combination of product and external ID will
+     * appear on its own row. An empty external ID will still be grouped by
+     * product only.
+     */
+    var byGroup = {};
     for (var i = 0; i < data.length; i++) {
       var r = data[i];
-      var product = (r[idxProduct] || '').trim();
-      var room = (r[idxRoom] || '').trim().toUpperCase();
+      var product = (r[idxProduct] || '').toString().trim();
+      var room = (r[idxRoom] || '').toString().trim().toUpperCase();
       var availRaw = (r[idxAvailable] || '0').toString().trim();
       var available = parseFloat(availRaw.replace(/,/g, '')) || 0;
       if (!product) continue;
-      if (!byProduct[product]) {
-        byProduct[product] = { product: product, floor: 0, dayVault: 0, vault: 0, batches: [], externals: [] };
+      var extVal = '';
+      if (idxExternal !== -1) {
+        extVal = (r[idxExternal] || '').toString().trim();
       }
-      var rec = byProduct[product];
-      if (room === 'SALES FLOOR') rec.floor += available;
-      else if (room === 'DAY VAULT') rec.dayVault += available;
-      else if (room === 'VAULT') rec.vault += available;
+      // Use a composite key of product and external ID. Empty external IDs
+      // effectively group by product alone.
+      var key = product + '||' + extVal;
+      if (!byGroup[key]) {
+        byGroup[key] = {
+          product: product,
+          external: extVal,
+          floor: 0,
+          dayVault: 0,
+          vault: 0,
+          batches: [],
+          expDate: null,
+          invDate: null,
+          // Store subroom names where day vault or vault stock resides
+          daySubRooms: [],
+          vaultSubRooms: []
+        };
+      }
+      var rec = byGroup[key];
+      // Sum available quantities based on room type. Only count on‑floor stock when room is 'SALES FLOOR'.
+      if (room === 'SALES FLOOR') {
+        rec.floor += available;
+      } else if (room === 'DAY VAULT') {
+        rec.dayVault += available;
+        // Capture subroom names for day vault stock
+        if (idxSubRoom !== -1) {
+          var sr = (r[idxSubRoom] || '').toString().trim();
+          if (sr && rec.daySubRooms.indexOf(sr) === -1) rec.daySubRooms.push(sr);
+        }
+      } else if (room === 'VAULT') {
+        rec.vault += available;
+        // Capture subroom names for vault stock
+        if (idxSubRoom !== -1) {
+          var sr2 = (r[idxSubRoom] || '').toString().trim();
+          if (sr2 && rec.vaultSubRooms.indexOf(sr2) === -1) rec.vaultSubRooms.push(sr2);
+        }
+      }
+      // Collect batch numbers
       if (idxBatch !== -1) {
         var batchVal = (r[idxBatch] || '').toString().trim();
         if (batchVal && rec.batches.indexOf(batchVal) === -1) rec.batches.push(batchVal);
       }
-      if (idxExternal !== -1) {
-        var extVal = (r[idxExternal] || '').toString().trim();
-        if (extVal && rec.externals.indexOf(extVal) === -1) rec.externals.push(extVal);
+      // Capture expiration date for sorting (use earliest date among records)
+      if (idxExp !== -1) {
+        var expRaw = (r[idxExp] || '').toString().trim();
+        if (expRaw) {
+          var d = new Date(expRaw);
+          if (!isNaN(d)) {
+            if (!rec.expDate || d < rec.expDate) {
+              rec.expDate = d;
+            }
+          }
+        }
+      }
+      // Capture inventory date for FIFO (use earliest date among records)
+      if (idxInv !== -1) {
+        var invRaw = (r[idxInv] || '').toString().trim();
+        if (invRaw) {
+          var di = new Date(invRaw);
+          if (!isNaN(di)) {
+            if (!rec.invDate || di < rec.invDate) {
+              rec.invDate = di;
+            }
+          }
+        }
       }
     }
-    // Build low list
+    // Determine which external ID is currently on the sales floor for each product and the floor count.
+    // We choose the external ID with the highest sales floor quantity.
+    var floorIdByProduct = {};
+    var floorCountByProduct = {};
+    Object.keys(byGroup).forEach(function(keyG) {
+      var rec = byGroup[keyG];
+      if (rec.floor > 0) {
+        var prod = rec.product;
+        var current = floorIdByProduct[prod];
+        var currentCount = current ? (byGroup[prod + '||' + current] ? byGroup[prod + '||' + current].floor : 0) : -1;
+        if (!current || rec.floor > currentCount) {
+          floorIdByProduct[prod] = rec.external;
+          floorCountByProduct[prod] = rec.floor;
+        }
+      }
+    });
+    // Build list of groups meeting low stock criteria
     var list = [];
-    var productNames = Object.keys(byProduct).sort();
-    for (var idx = 0; idx < productNames.length; idx++) {
-      var name = productNames[idx];
-      var item = byProduct[name];
-      if (item.floor <= threshold && item.dayVault === 0 && item.vault > 0) {
+    var groupKeys = Object.keys(byGroup);
+    // Sort by product then external for stable output
+    groupKeys.sort(function(a, b){
+      var pa = byGroup[a].product.toLowerCase();
+      var pb = byGroup[b].product.toLowerCase();
+      if (pa < pb) return -1;
+      if (pa > pb) return 1;
+      var ea = byGroup[a].external.toLowerCase();
+      var eb = byGroup[b].external.toLowerCase();
+      if (ea < eb) return -1;
+      if (ea > eb) return 1;
+      return 0;
+    });
+    for (var g = 0; g < groupKeys.length; g++) {
+      var keyG = groupKeys[g];
+      var item = byGroup[keyG];
+      // Base filter: include groups for a product only if the current floor count
+      // for that product is at or below the threshold, and there is remaining stock
+      // (either day vault or main vault > 0) for this external ID.
+      var productFloorCount = floorCountByProduct[item.product] || 0;
+      if (productFloorCount <= threshold && (item.dayVault > 0 || item.vault > 0)) {
         list.push({
           product: item.product,
           floor: item.floor,
           dayVault: item.dayVault,
           vault: item.vault,
           batch: item.batches.join(', '),
-          external: item.externals.join(', ')
+          external: item.external,
+          expDate: item.expDate,
+          invDate: item.invDate,
+          daySubRooms: item.daySubRooms,
+          vaultSubRooms: item.vaultSubRooms
         });
       }
     }
-    // Render table
-    var tbody = getEl('lowListBody');
-    tbody.innerHTML = '';
-    if (list.length === 0) {
-      getEl('lowListTable').classList.add('hidden');
-      getEl('lowListEmpty').classList.remove('hidden');
-    } else {
-      getEl('lowListEmpty').classList.add('hidden');
-      getEl('lowListTable').classList.remove('hidden');
-      for (var k = 0; k < list.length; k++) {
-        var it = list[k];
-        var tr = document.createElement('tr');
-        tr.innerHTML = '<td>'+escapeHtml(it.product)+'</td>'+
-                       '<td>'+it.floor+'</td>'+
-                       '<td>'+it.dayVault+'</td>'+
-                       '<td>'+it.vault+'</td>'+
-                       '<td>'+escapeHtml(it.batch)+'</td>'+
-                       '<td>'+escapeHtml(it.external)+'</td>';
-        tbody.appendChild(tr);
-      }
+    // Additional filtering: for each product, choose only one external package ID to restock
+    // according to business rules: if the current external ID on the sales floor has
+    // additional stock (dayVault or vault), use it first. Otherwise prefer
+    // external IDs with dayVault stock, then vault stock. Within each category
+    // choose the oldest batch by expiration date (FIFO).
+    var groupedByProduct = {};
+    for (var li = 0; li < list.length; li++) {
+      var it = list[li];
+      if (!groupedByProduct[it.product]) groupedByProduct[it.product] = [];
+      groupedByProduct[it.product].push(it);
     }
-    // Update summary and enable download
-    var total = Object.keys(byProduct).length;
-    getEl('summary').innerHTML = 'Analyzed '+total+' products. Found <strong>'+list.length+'</strong> low stock items at Sales Floor ≤ '+threshold+', Day Vault = 0, Vault &gt; 0.';
-    getEl('downloadBtn').disabled = list.length === 0;
-    // Save lowRows for CSV download
-    window.__lowRows = list;
-    getEl('status').textContent = list.length ? 'Done' : 'Done, no matches';
+    var filtered = [];
+    Object.keys(groupedByProduct).forEach(function(prod) {
+      var items = groupedByProduct[prod];
+      // Category 1: same external ID currently on the floor (floor > 0)
+      var floorItems = items.filter(function(it){ return it.floor > 0 && (it.dayVault > 0 || it.vault > 0); });
+      // Category 2: no floor stock but day vault has stock
+      var dayItems = items.filter(function(it){ return it.floor === 0 && it.dayVault > 0; });
+      // Category 3: only vault stock
+      var vaultItems = items.filter(function(it){ return it.floor === 0 && it.dayVault === 0 && it.vault > 0; });
+      var chosen = null;
+      var chooseFrom = null;
+      if (floorItems.length > 0) {
+        chooseFrom = floorItems;
+      } else if (dayItems.length > 0) {
+        chooseFrom = dayItems;
+      } else if (vaultItems.length > 0) {
+        chooseFrom = vaultItems;
+      }
+      if (chooseFrom) {
+        // Sort by earliest inventory date (FIFO), falling back to expiration date.
+        chooseFrom.sort(function(a, b) {
+          var da = a.invDate;
+          var db = b.invDate;
+          // If both have invDate, compare those
+          if (da && db) {
+            return da - db;
+          }
+          // If only a has invDate, it comes first
+          if (da && !db) return -1;
+          if (!da && db) return 1;
+          // Fallback: compare expiration dates
+          var ea = a.expDate;
+          var eb = b.expDate;
+          if (ea && eb) return ea - eb;
+          if (ea && !eb) return -1;
+          if (!ea && eb) return 1;
+          return 0;
+        });
+        chosen = chooseFrom[0];
+      }
+      if (chosen) {
+        // attach the floor external ID for display
+        chosen.floorExternal = floorIdByProduct[prod] || '';
+        // determine restock room and subroom based on available stock
+        if (chosen.dayVault > 0) {
+          chosen.restockRoom = 'Day Vault';
+          var dsr = chosen.daySubRooms || [];
+          chosen.subroom = dsr.join(', ');
+        } else if (chosen.vault > 0) {
+          chosen.restockRoom = 'Vault';
+          var vsr = chosen.vaultSubRooms || [];
+          chosen.subroom = vsr.join(', ');
+        } else {
+          chosen.restockRoom = '';
+          chosen.subroom = '';
+        }
+        filtered.push(chosen);
+      }
+    });
+    // Render table using the filtered list
+    // Save the base list of low stock rows for further filtering/sorting
+    window.__lowRows = filtered;
+    // Save original metadata for summary
+    window.__analysisInfo = { total: (typeof groupKeys !== 'undefined' && groupKeys) ? groupKeys.length : 0, threshold: threshold };
+    // After computing low stock, refresh display based on current sort/filter
+    refreshDisplay();
+    getEl('status').textContent = filtered.length ? 'Done' : 'Done, no matches';
   };
   reader.readAsText(file);
 });
 
 getEl('downloadBtn').addEventListener('click', function() {
-  var list = window.__lowRows || [];
+  var list = window.__displayRows || window.__lowRows || [];
   if (!list.length) return;
   var rows = [];
-  rows.push(['Product','Sales Floor Available','Day Vault Available','Vault Available','Batch','External ID']);
+  rows.push(['Product','Sales Floor Available','Day Vault Available','Vault Available','Batch','External ID (Restock)','Current Floor ID','Restock Room','Subroom']);
   for (var i = 0; i < list.length; i++) {
     var it = list[i];
-    rows.push([it.product, it.floor, it.dayVault, it.vault, it.batch, it.external]);
+    rows.push([it.product, it.floor, it.dayVault, it.vault, it.batch, it.external, it.floorExternal || '', it.restockRoom || '', it.subroom || '']);
   }
   var csv = toCSV(rows);
   var blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
@@ -282,6 +480,105 @@ getEl('downloadBtn').addEventListener('click', function() {
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; });
+}
+
+/**
+ * Refresh the displayed list of low stock rows based on current
+ * sort and filter selections. Uses window.__lowRows (raw list
+ * computed by analyze) and produces window.__displayRows (the
+ * sorted/filtered list actually shown). Updates the table and
+ * summary accordingly, and sets the download button enabled state.
+ */
+function refreshDisplay() {
+  var baseRows = window.__lowRows || [];
+  var sortSel = getEl('sortField');
+  var filterSel = getEl('filterStock');
+  var sortVal = sortSel ? sortSel.value : 'product';
+  var filterVal = filterSel ? filterSel.value : 'all';
+  // Apply filter
+  var rows = baseRows.slice(); // shallow copy
+  if (filterVal === 'day') {
+    rows = rows.filter(function(r){ return r.dayVault > 0; });
+  } else if (filterVal === 'vault') {
+    rows = rows.filter(function(r){ return r.dayVault === 0 && r.vault > 0; });
+  }
+  // Sort rows
+  rows.sort(function(a,b){
+    switch(sortVal) {
+      case 'product': {
+        var pa=a.product.toLowerCase(), pb=b.product.toLowerCase();
+        if (pa<pb) return -1; if (pa>pb) return 1; return 0;
+      }
+      case 'product-desc': {
+        var pa=a.product.toLowerCase(), pb=b.product.toLowerCase();
+        if (pa<pb) return 1; if (pa>pb) return -1; return 0;
+      }
+      case 'floor': {
+        return a.floor - b.floor;
+      }
+      case 'floor-desc': {
+        return b.floor - a.floor;
+      }
+      case 'dayVault': {
+        return a.dayVault - b.dayVault;
+      }
+      case 'dayVault-desc': {
+        return b.dayVault - a.dayVault;
+      }
+      case 'vault': {
+        return a.vault - b.vault;
+      }
+      case 'vault-desc': {
+        return b.vault - a.vault;
+      }
+      default: {
+        // default to product A->Z
+        var pa=a.product.toLowerCase(), pb=b.product.toLowerCase();
+        if (pa<pb) return -1; if (pa>pb) return 1; return 0;
+      }
+    }
+  });
+  // Update table body
+  var tbody = getEl('lowListBody');
+  tbody.innerHTML = '';
+  if (rows.length === 0) {
+    getEl('lowListTable').classList.add('hidden');
+    getEl('lowListEmpty').classList.remove('hidden');
+  } else {
+    getEl('lowListEmpty').classList.add('hidden');
+    getEl('lowListTable').classList.remove('hidden');
+      for (var k = 0; k < rows.length; k++) {
+        var it2 = rows[k];
+        var diff = it2.floorExternal && it2.external && it2.floorExternal !== it2.external;
+        var floorClass = diff ? 'highlight-green' : '';
+        var floorExtClass = diff ? 'highlight-green' : '';
+        var extClass = diff ? 'highlight-red' : '';
+        var dayClass = (diff && it2.dayVault > 0) ? 'highlight-red' : '';
+        var vaultClass = (diff && it2.vault > 0) ? 'highlight-red' : '';
+        var tr = document.createElement('tr');
+        // Determine subroom highlight: highlight in red if switching to a different external ID
+        var subClass = (diff && ( (it2.dayVault > 0 && it2.restockRoom === 'Day Vault') || (it2.vault > 0 && it2.restockRoom === 'Vault') )) ? 'highlight-red' : '';
+    tr.innerHTML = '<td>'+escapeHtml(it2.product)+'</td>'+
+                   '<td class="'+floorClass+'">'+it2.floor+'</td>'+
+                   '<td class="'+dayClass+'">'+it2.dayVault+'</td>'+
+                   '<td class="'+vaultClass+'">'+it2.vault+'</td>'+
+                   '<td>'+escapeHtml(it2.batch)+'</td>'+
+                   '<td class="'+extClass+'">'+escapeHtml(it2.external)+'</td>'+
+                   '<td class="'+floorExtClass+'">'+escapeHtml(it2.floorExternal || '')+'</td>'+
+                   '<td>'+escapeHtml(it2.restockRoom || '')+'</td>'+
+                   '<td class="'+subClass+'">'+escapeHtml(it2.subroom || '')+'</td>';
+        tbody.appendChild(tr);
+      }
+  }
+  // Update summary text using analysis info
+  var info = window.__analysisInfo || { total: 0, threshold: 0 };
+  var itemsLabel = info.total === 1 ? 'item' : 'items';
+  var lowLabel = rows.length === 1 ? 'item' : 'items';
+  getEl('summary').innerHTML = 'Analyzed '+info.total+' '+itemsLabel+'. Found <strong>'+rows.length+'</strong> low stock '+lowLabel+' where Sales Floor ≤ '+info.threshold+' and there is additional stock (Day Vault or Vault).';
+  // Save displayRows for download
+  window.__displayRows = rows;
+  // Enable/disable download button
+  getEl('downloadBtn').disabled = rows.length === 0;
 }
 
 // Initial status
