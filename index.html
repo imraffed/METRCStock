@@ -269,9 +269,15 @@ getEl('analyzeBtn').addEventListener('click', function() {
       }
       var rec = byGroup[key];
       // Sum available quantities based on room type
-      if (room === 'SALES FLOOR') rec.floor += available;
-      else if (room === 'DAY VAULT') rec.dayVault += available;
-      else if (room === 'VAULT') rec.vault += available;
+      // Treat 'FOH DISPLAY' the same as 'SALES FLOOR' because it counts as on‑floor stock.
+      // This prevents recommending a restock when there are still items on display.
+      if (room === 'SALES FLOOR' || room === 'FOH DISPLAY') {
+        rec.floor += available;
+      } else if (room === 'DAY VAULT') {
+        rec.dayVault += available;
+      } else if (room === 'VAULT') {
+        rec.vault += available;
+      }
       // Collect batch numbers
       if (idxBatch !== -1) {
         var batchVal = (r[idxBatch] || '').toString().trim();
@@ -302,16 +308,19 @@ getEl('analyzeBtn').addEventListener('click', function() {
         }
       }
     }
-    // Determine which external ID is currently on the sales floor for each product.
+    // Determine which external ID is currently on the sales floor for each product and the floor count.
     // We choose the external ID with the highest sales floor quantity.
     var floorIdByProduct = {};
+    var floorCountByProduct = {};
     Object.keys(byGroup).forEach(function(keyG) {
       var rec = byGroup[keyG];
       if (rec.floor > 0) {
         var prod = rec.product;
         var current = floorIdByProduct[prod];
-        if (!current || rec.floor > (byGroup[prod + '||' + current] ? byGroup[prod + '||' + current].floor : 0)) {
+        var currentCount = current ? (byGroup[prod + '||' + current] ? byGroup[prod + '||' + current].floor : 0) : -1;
+        if (!current || rec.floor > currentCount) {
           floorIdByProduct[prod] = rec.external;
+          floorCountByProduct[prod] = rec.floor;
         }
       }
     });
@@ -333,9 +342,11 @@ getEl('analyzeBtn').addEventListener('click', function() {
     for (var g = 0; g < groupKeys.length; g++) {
       var keyG = groupKeys[g];
       var item = byGroup[keyG];
-      // Base filter: include groups where sales floor is below or equal to threshold
-      // and there is remaining stock to restock (either day vault or main vault > 0).
-      if (item.floor <= threshold && (item.dayVault > 0 || item.vault > 0)) {
+      // Base filter: include groups for a product only if the current floor count
+      // for that product is at or below the threshold, and there is remaining stock
+      // (either day vault or main vault > 0) for this external ID.
+      var productFloorCount = floorCountByProduct[item.product] || 0;
+      if (productFloorCount <= threshold && (item.dayVault > 0 || item.vault > 0)) {
         list.push({
           product: item.product,
           floor: item.floor,
