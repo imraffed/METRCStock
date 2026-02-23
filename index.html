@@ -430,6 +430,8 @@ getEl('analyzeBtn').addEventListener('click', function() {
       if (chosen) {
         // attach the floor external ID for display
         chosen.floorExternal = floorIdByProduct[prod] || '';
+        // IMPORTANT: display total product floor count, not the chosen external's floor count
+        chosen.floor = floorCountByProduct[prod] || 0;
         // determine restock room and subroom based on available stock
         if (chosen.dayVault > 0) {
           chosen.restockRoom = 'Day Vault';
